@@ -623,12 +623,29 @@ fn run_app(
                 if key.code == KeyCode::Char('n')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    if assistant_session.is_some() {
-                        app.last_error = Some(
-                            "Assistant is still responding. Wait, then start a new chat."
-                                .to_string(),
+                    if let Some(session) = assistant_session.as_ref() {
+                        if args.debug {
+                            debug_log(
+                                &debug_logs,
+                                "[input] Ctrl+N requested -> cancel TTS and LLM, then reset chat",
+                            );
+                        }
+                        session.cancel_llm.store(true, Ordering::SeqCst);
+                        request_tts_cancel(session, args.debug, &debug_logs);
+
+                        finish_assistant_turn(
+                            app,
+                            convo,
+                            &mut pending_user_turn,
+                            None,
+                            capture_enabled,
+                            audio_stream,
+                            stt,
+                            rx_audio,
+                            args.post_tts_mute_ms,
+                            args.debug,
                         );
-                        continue;
+                        assistant_session = None;
                     }
 
                     convo.clear();
