@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use stt::{SttConfig, SttEngine, SttUpdate};
 use tts::{PlayerKind, TtsConfig, TtsEngine};
 
@@ -51,6 +51,8 @@ Erantzun arauak:
 const MIC_SETTLE_MS: u64 = 30;
 const MAX_UI_MESSAGES: usize = 300;
 const NEW_CHAT_BANNER: &str = "Txat berria hasi da. Hitz egin edo idatzi mezua eta sakatu Enter.";
+const ECHO_GUARD_WINDOW: Duration = Duration::from_secs(12);
+const ECHO_GUARD_MIN_CHARS: usize = 10;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DuplexState {
@@ -196,6 +198,8 @@ struct AppState {
     last_error: Option<String>,
     mic_name: String,
     openai_base_url: String,
+    last_assistant_text: String,
+    last_assistant_at: Option<Instant>,
 }
 
 impl AppState {
@@ -210,6 +214,8 @@ impl AppState {
             last_error: None,
             mic_name,
             openai_base_url,
+            last_assistant_text: String::new(),
+            last_assistant_at: None,
         }
     }
 
@@ -242,6 +248,8 @@ impl AppState {
         self.streaming_assistant.clear();
         self.assistant_active = false;
         self.last_error = None;
+        self.last_assistant_text.clear();
+        self.last_assistant_at = None;
         self.push_message(MessageRole::Assistant, NEW_CHAT_BANNER.to_string());
     }
 }
@@ -403,6 +411,15 @@ fn run_app(
                     continue;
                 }
 
+                if is_probable_tts_echo(app, &send_text) {
+                    app.clear_input();
+                    app.last_error = Some(
+                        "Ignored probable speaker echo. Use headphones or lower speaker volume."
+                            .to_string(),
+                    );
+                    continue;
+                }
+
                 assistant_events = Some(begin_assistant_turn(
                     send_text.clone(),
                     app,
@@ -516,6 +533,15 @@ fn run_app(
                 if key.code == KeyCode::Enter {
                     let text = app.input.trim().to_string();
                     if text.is_empty() {
+                        continue;
+                    }
+
+                    if is_probable_tts_echo(app, &text) {
+                        app.clear_input();
+                        app.last_error = Some(
+                            "Ignored probable speaker echo. Use headphones or lower speaker volume."
+                                .to_string(),
+                        );
                         continue;
                     }
 
@@ -665,6 +691,8 @@ fn finish_assistant_turn(
         final_text = final_text.trim().to_string();
         if !final_text.is_empty() {
             app.push_message(MessageRole::Assistant, final_text.clone());
+            app.last_assistant_text = final_text.clone();
+            app.last_assistant_at = Some(Instant::now());
             if let Some(user_text) = pending_user_turn.take() {
                 convo.add_turn(user_text, final_text);
             }
@@ -877,6 +905,73 @@ fn estimate_wrapped_lines(lines: &[String], width: usize) -> usize {
             }
         })
         .sum()
+}
+
+fn is_probable_tts_echo(app: &AppState, candidate: &str) -> bool {
+    if candidate.chars().count() < ECHO_GUARD_MIN_CHARS {
+        return false;
+    }
+
+    let Some(last_at) = app.last_assistant_at else {
+        return false;
+    };
+    if last_at.elapsed() > ECHO_GUARD_WINDOW {
+        return false;
+    }
+
+    if app.last_assistant_text.trim().is_empty() {
+        return false;
+    }
+
+    let candidate_norm = normalize_for_echo(candidate);
+    let assistant_norm = normalize_for_echo(&app.last_assistant_text);
+    if candidate_norm.is_empty() || assistant_norm.is_empty() {
+        return false;
+    }
+
+    if assistant_norm.contains(&candidate_norm) || candidate_norm.contains(&assistant_norm) {
+        return true;
+    }
+
+    let candidate_tokens = tokenize_for_echo(&candidate_norm);
+    let assistant_tokens = tokenize_for_echo(&assistant_norm);
+    if candidate_tokens.is_empty() || assistant_tokens.is_empty() {
+        return false;
+    }
+
+    let mut overlap = 0usize;
+    for token in &candidate_tokens {
+        if assistant_tokens.contains(token) {
+            overlap += 1;
+        }
+    }
+
+    let min_len = candidate_tokens.len().min(assistant_tokens.len());
+    let overlap_ratio = overlap as f32 / min_len as f32;
+    overlap_ratio >= 0.72
+}
+
+fn normalize_for_echo(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn tokenize_for_echo(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| t.to_string())
+        .collect()
 }
 
 fn strip_visual_decorations(input: &str) -> String {

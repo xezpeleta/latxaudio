@@ -1,0 +1,1 @@
+- Build always using Docker: docker-build.sh
