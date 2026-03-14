@@ -24,6 +24,9 @@ Additionally, streamed assistant text is sanitized at runtime to remove common e
 - Streaming assistant tokens rendered immediately in chat while TTS plays
 - Incremental TTS chunking to start playback before full response is finished
 - OpenAI default endpoint with configurable base URL for local/remote compatible servers
+- `Translate` function (`Ctrl+T`) with target language picker in a popup window
+- Translate mode: microphone Basque speech is auto-translated by LLM and synthesized via Piper TTS
+- Translation targets are enabled only when both matching Piper files exist in `models/piper` (`*.onnx` and `*.onnx.json`)
 
 ## Requirements
 
@@ -108,8 +111,14 @@ Keyboard controls:
 
 - `Enter`: send current input to the assistant
 - `Ctrl+N`: start a new chat (clears current conversation and input)
+- `Ctrl+T`: open translation target picker and switch function mode
 - `Esc`: clear current input
 - `q` or `Ctrl+C`: quit
+
+When Translate mode is enabled, the app is no longer a chat: each final Basque utterance from the microphone is translated directly to the selected target language (no chat history memory), streamed on screen, and spoken by Piper.
+Each enabled language uses its own Piper voice model+config from `models/piper`.
+Languages without a detected voice, or without the matching `.onnx.json`, are shown as disabled in the picker and cannot be selected.
+Use `Ctrl+T` again and choose `Back to chat mode` to return to normal chat behavior.
 
 Use a custom OpenAI-compatible endpoint:
 

@@ -6,7 +6,7 @@ mod tts;
 
 use anyhow::{Context, Result};
 use audio::{build_audio_stream, resample, select_input_device, TARGET_SAMPLE_RATE};
-use chat::Conversation;
+use chat::{ChatMessage, Conversation};
 use clap::{Parser, ValueEnum};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,9 +16,11 @@ use crossterm::terminal::{
 };
 use llm::LlmClient;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{stdout, Stdout};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -55,16 +57,99 @@ Erantzun arauak:
 const MIC_SETTLE_MS: u64 = 30;
 const MAX_UI_MESSAGES: usize = 300;
 const NEW_CHAT_BANNER: &str = "Txat berria hasi da. Hitz egin edo idatzi mezua eta sakatu Enter.";
+const TRANSLATE_MODE_BANNER_PREFIX: &str =
+    "Itzulpen modua aktibatuta. Iturburua: euskara. Helmuga: ";
+const TRANSLATE_MODE_BANNER_SUFFIX: &str =
+    ". Hitz egin mikrofonotik eta itzulpena automatikoki egingo da.";
 const ECHO_GUARD_WINDOW: Duration = Duration::from_secs(12);
 const ECHO_GUARD_MIN_CHARS: usize = 10;
 const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(600);
+const PICKER_BACK_TO_CHAT: &str = "Back to chat mode";
 static DEBUG_LOGS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+
+struct TranslationLanguageSpec {
+    label: &'static str,
+    target_language: &'static str,
+    voice_prefixes: &'static [&'static str],
+}
+
+const TRANSLATION_LANGUAGE_SPECS: &[TranslationLanguageSpec] = &[
+    TranslationLanguageSpec {
+        label: "English",
+        target_language: "English",
+        voice_prefixes: &["en_", "en-"],
+    },
+    TranslationLanguageSpec {
+        label: "Spanish",
+        target_language: "Spanish",
+        voice_prefixes: &["es_", "es-"],
+    },
+    TranslationLanguageSpec {
+        label: "French",
+        target_language: "French",
+        voice_prefixes: &["fr_", "fr-"],
+    },
+    TranslationLanguageSpec {
+        label: "German",
+        target_language: "German",
+        voice_prefixes: &["de_", "de-"],
+    },
+    TranslationLanguageSpec {
+        label: "Italian",
+        target_language: "Italian",
+        voice_prefixes: &["it_", "it-"],
+    },
+    TranslationLanguageSpec {
+        label: "Portuguese",
+        target_language: "Portuguese",
+        voice_prefixes: &["pt_", "pt-"],
+    },
+    TranslationLanguageSpec {
+        label: "Catalan",
+        target_language: "Catalan",
+        voice_prefixes: &["ca_", "ca-"],
+    },
+    TranslationLanguageSpec {
+        label: "Galician",
+        target_language: "Galician",
+        voice_prefixes: &["gl_", "gl-"],
+    },
+    TranslationLanguageSpec {
+        label: "Japanese",
+        target_language: "Japanese",
+        voice_prefixes: &["ja_", "ja-"],
+    },
+    TranslationLanguageSpec {
+        label: "Arabic",
+        target_language: "Arabic",
+        voice_prefixes: &["ar_", "ar-"],
+    },
+];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DuplexState {
     Listening,
     Thinking,
     Speaking,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AppMode {
+    Chat,
+    Translate { target_language: String },
+}
+
+impl AppMode {
+    fn is_chat(&self) -> bool {
+        matches!(self, Self::Chat)
+    }
+
+    fn function_label(&self) -> String {
+        match self {
+            Self::Chat => "CHAT".to_string(),
+            Self::Translate { target_language } => format!("TRANSLATE -> {target_language}"),
+        }
+    }
 }
 
 impl DuplexState {
@@ -194,7 +279,25 @@ struct UiMessage {
     content: String,
 }
 
+struct LanguagePickerState {
+    selected: usize,
+}
+
+struct TranslationLanguageOption {
+    label: String,
+    target_language: String,
+    voice_model: Option<PathBuf>,
+    voice_config: Option<PathBuf>,
+}
+
+impl TranslationLanguageOption {
+    fn is_enabled(&self) -> bool {
+        self.voice_model.is_some() && self.voice_config.is_some()
+    }
+}
+
 struct AppState {
+    mode: AppMode,
     duplex_state: DuplexState,
     input: String,
     input_from_stt: bool,
@@ -207,11 +310,18 @@ struct AppState {
     last_assistant_text: String,
     last_assistant_at: Option<Instant>,
     last_esc_at: Option<Instant>,
+    language_picker: Option<LanguagePickerState>,
+    translation_options: Vec<TranslationLanguageOption>,
 }
 
 impl AppState {
-    fn new(mic_name: String, openai_base_url: String) -> Self {
+    fn new(
+        mic_name: String,
+        openai_base_url: String,
+        translation_options: Vec<TranslationLanguageOption>,
+    ) -> Self {
         Self {
+            mode: AppMode::Chat,
             duplex_state: DuplexState::Listening,
             input: String::new(),
             input_from_stt: false,
@@ -224,6 +334,8 @@ impl AppState {
             last_assistant_text: String::new(),
             last_assistant_at: None,
             last_esc_at: None,
+            language_picker: None,
+            translation_options,
         }
     }
 
@@ -245,6 +357,11 @@ impl AppState {
         }
     }
 
+    fn apply_stt_partial_force(&mut self, partial: String) {
+        self.input = partial;
+        self.input_from_stt = true;
+    }
+
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_from_stt = false;
@@ -259,7 +376,84 @@ impl AppState {
         self.last_assistant_text.clear();
         self.last_assistant_at = None;
         self.last_esc_at = None;
+        self.language_picker = None;
         self.push_message(MessageRole::Assistant, NEW_CHAT_BANNER.to_string());
+    }
+
+    fn clear_for_mode_switch(&mut self) {
+        self.clear_input();
+        self.messages.clear();
+        self.streaming_assistant.clear();
+        self.assistant_active = false;
+        self.last_error = None;
+        self.last_assistant_text.clear();
+        self.last_assistant_at = None;
+        self.last_esc_at = None;
+    }
+
+    fn set_chat_mode(&mut self) -> bool {
+        if self.mode.is_chat() {
+            return false;
+        }
+
+        self.mode = AppMode::Chat;
+        self.clear_for_mode_switch();
+        self.push_message(MessageRole::Assistant, NEW_CHAT_BANNER.to_string());
+        true
+    }
+
+    fn set_translate_mode(&mut self, target_language: String) -> bool {
+        if let AppMode::Translate {
+            target_language: current,
+        } = &self.mode
+        {
+            if current == &target_language {
+                return false;
+            }
+        }
+
+        self.mode = AppMode::Translate {
+            target_language: target_language.clone(),
+        };
+        self.clear_for_mode_switch();
+        self.push_message(
+            MessageRole::Assistant,
+            format!(
+                "{TRANSLATE_MODE_BANNER_PREFIX}{target_language}{TRANSLATE_MODE_BANNER_SUFFIX}"
+            ),
+        );
+        true
+    }
+
+    fn open_language_picker(&mut self) {
+        let mut selected = self
+            .translation_options
+            .iter()
+            .position(TranslationLanguageOption::is_enabled)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+
+        if let AppMode::Translate { target_language } = &self.mode {
+            if let Some(index) = self
+                .translation_options
+                .iter()
+                .position(|item| item.target_language.eq_ignore_ascii_case(target_language))
+            {
+                selected = index + 1;
+            }
+        }
+
+        self.language_picker = Some(LanguagePickerState { selected });
+    }
+
+    fn picker_len(&self) -> usize {
+        1 + self.translation_options.len()
+    }
+
+    fn picker_option(&self, selected: usize) -> Option<&TranslationLanguageOption> {
+        selected
+            .checked_sub(1)
+            .and_then(|idx| self.translation_options.get(idx))
     }
 }
 
@@ -275,6 +469,169 @@ struct AssistantSession {
     cancel_tts: Arc<AtomicBool>,
     cancel_llm: Arc<AtomicBool>,
     tts_session: Arc<Mutex<Option<TtsSession>>>,
+}
+
+struct TurnRequest {
+    messages: Vec<ChatMessage>,
+    sanitize_output: bool,
+    remember_turn: bool,
+}
+
+fn build_turn_request(app: &AppState, convo: &Conversation, user_text: &str) -> TurnRequest {
+    match &app.mode {
+        AppMode::Chat => TurnRequest {
+            messages: convo.build_messages(user_text),
+            sanitize_output: true,
+            remember_turn: true,
+        },
+        AppMode::Translate { target_language } => TurnRequest {
+            messages: build_translate_messages(user_text, target_language),
+            sanitize_output: false,
+            remember_turn: false,
+        },
+    }
+}
+
+fn build_translate_messages(user_text: &str, target_language: &str) -> Vec<ChatMessage> {
+    let system_prompt = format!(
+        "You are a real-time translation engine. Source language is Basque. Translate each user utterance from Basque into {target_language}. Return only the translated text in {target_language} with no explanations, no notes, and no extra formatting."
+    );
+
+    vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_text.to_string(),
+        },
+    ]
+}
+
+fn discover_translation_options(piper_dir: &Path) -> Vec<TranslationLanguageOption> {
+    let mut models: Vec<PathBuf> = fs::read_dir(piper_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+        })
+        .collect();
+
+    models.sort_by(|a, b| {
+        a.file_name()
+            .unwrap_or_default()
+            .cmp(b.file_name().unwrap_or_default())
+    });
+
+    TRANSLATION_LANGUAGE_SPECS
+        .iter()
+        .map(|spec| {
+            let voice_model = models
+                .iter()
+                .find(|model_path| {
+                    let file_name = model_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    spec.voice_prefixes.iter().any(|prefix| {
+                        let prefix = prefix.to_ascii_lowercase();
+                        file_name.starts_with(&prefix)
+                    })
+                })
+                .cloned();
+
+            TranslationLanguageOption {
+                label: spec.label.to_string(),
+                target_language: spec.target_language.to_string(),
+                voice_config: voice_model.as_ref().and_then(|model| {
+                    let mut raw = model.as_os_str().to_string_lossy().to_string();
+                    raw.push_str(".json");
+                    let config = PathBuf::from(raw);
+                    config.exists().then_some(config)
+                }),
+                voice_model,
+            }
+        })
+        .collect()
+}
+
+fn build_translation_tts_engines(
+    options: &mut [TranslationLanguageOption],
+    args: &Args,
+) -> HashMap<String, Arc<TtsEngine>> {
+    let mut out = HashMap::new();
+
+    for option in options.iter_mut() {
+        let Some(model) = option.voice_model.clone() else {
+            continue;
+        };
+        let Some(config) = option.voice_config.clone() else {
+            eprintln!(
+                "[latxaudio] warning: disabling translation language '{}' (missing config for {}).",
+                option.label,
+                model.display(),
+            );
+            option.voice_model = None;
+            continue;
+        };
+
+        let cfg = TtsConfig {
+            piper_model: model.clone(),
+            piper_config: Some(config),
+            piper_speaker: args.piper_speaker,
+            piper_length_scale: args.piper_length_scale,
+            piper_noise_scale: args.piper_noise_scale,
+            piper_noise_w_scale: args.piper_noise_w_scale,
+            piper_sentence_silence: args.piper_sentence_silence,
+            player: match args.player {
+                Playback::Aplay => PlayerKind::Aplay,
+                Playback::PwPlay => PlayerKind::PwPlay,
+            },
+        };
+
+        match TtsEngine::new(cfg) {
+            Ok(engine) => {
+                out.insert(option.target_language.clone(), Arc::new(engine));
+            }
+            Err(err) => {
+                eprintln!(
+                    "[latxaudio] warning: disabling translation language '{}' (voice {}): {}",
+                    option.label,
+                    model.display(),
+                    err
+                );
+                option.voice_model = None;
+                option.voice_config = None;
+            }
+        }
+    }
+
+    out
+}
+
+fn resolve_turn_tts_engine(
+    app: &AppState,
+    chat_tts_engine: &Arc<TtsEngine>,
+    translation_tts_engines: &HashMap<String, Arc<TtsEngine>>,
+) -> Result<Arc<TtsEngine>> {
+    match &app.mode {
+        AppMode::Chat => Ok(Arc::clone(chat_tts_engine)),
+        AppMode::Translate { target_language } => translation_tts_engines
+            .get(target_language)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No Piper voice loaded for target language '{}'. Open Ctrl+T and choose another language.",
+                    target_language
+                )
+            }),
+    }
 }
 
 fn main() -> Result<()> {
@@ -315,7 +672,7 @@ fn main() -> Result<()> {
         args.llm_timeout_secs,
     )?);
 
-    let tts_engine = Arc::new(TtsEngine::new(TtsConfig {
+    let chat_tts_engine = Arc::new(TtsEngine::new(TtsConfig {
         piper_model: args.piper_model.clone(),
         piper_config: args.piper_config.clone(),
         piper_speaker: args.piper_speaker,
@@ -328,6 +685,10 @@ fn main() -> Result<()> {
             Playback::PwPlay => PlayerKind::PwPlay,
         },
     })?);
+
+    let piper_dir = PathBuf::from("./models/piper");
+    let mut translation_options = discover_translation_options(&piper_dir);
+    let translation_tts_engines = build_translation_tts_engines(&mut translation_options, &args);
 
     let system_prompt = resolve_system_prompt(&args)?;
     let mut convo = Conversation::new(system_prompt, args.max_turns);
@@ -344,7 +705,7 @@ fn main() -> Result<()> {
         .play()
         .context("Failed to start microphone stream")?;
 
-    let mut app = AppState::new(mic_name, args.openai_base_url.clone());
+    let mut app = AppState::new(mic_name, args.openai_base_url.clone(), translation_options);
     app.push_message(
         MessageRole::Assistant,
         "Prest nago. Hitz egin edo idatzi mezua eta sakatu Enter.".to_string(),
@@ -359,7 +720,8 @@ fn main() -> Result<()> {
         &mut convo,
         &mut stt,
         llm,
-        tts_engine,
+        chat_tts_engine,
+        &translation_tts_engines,
         capture_rate,
         &capture_enabled,
         &audio_stream,
@@ -431,7 +793,8 @@ fn run_app(
     convo: &mut Conversation,
     stt: &mut SttEngine,
     llm: Arc<LlmClient>,
-    tts_engine: Arc<TtsEngine>,
+    chat_tts_engine: Arc<TtsEngine>,
+    translation_tts_engines: &HashMap<String, Arc<TtsEngine>>,
     capture_rate: u32,
     capture_enabled: &Arc<AtomicBool>,
     audio_stream: &cpal::Stream,
@@ -441,13 +804,13 @@ fn run_app(
     let mut assistant_session: Option<AssistantSession> = None;
     let mut pending_user_turn: Option<String> = None;
 
-    loop {
+    'app_loop: loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
 
         while let Ok(chunk) = rx_audio.try_recv() {
-            if app.duplex_state != DuplexState::Listening {
+            if app.duplex_state != DuplexState::Listening || app.language_picker.is_some() {
                 continue;
             }
 
@@ -458,7 +821,11 @@ fn run_app(
             } = stt.accept_audio(&resampled);
 
             if let Some(partial) = partial {
-                app.apply_stt_partial(partial);
+                if app.mode.is_chat() {
+                    app.apply_stt_partial(partial);
+                } else {
+                    app.apply_stt_partial_force(partial);
+                }
             }
 
             if let Some(final_text) = final_text {
@@ -466,10 +833,14 @@ fn run_app(
                     continue;
                 }
 
-                let send_text = if app.input.trim().is_empty() {
-                    final_text.trim().to_string()
+                let send_text = if app.mode.is_chat() {
+                    if app.input.trim().is_empty() {
+                        final_text.trim().to_string()
+                    } else {
+                        app.input.trim().to_string()
+                    }
                 } else {
-                    app.input.trim().to_string()
+                    final_text.trim().to_string()
                 };
 
                 if send_text.is_empty() {
@@ -485,10 +856,24 @@ fn run_app(
                     continue;
                 }
 
+                let turn_request = build_turn_request(app, convo, &send_text);
+                let tts_engine = match resolve_turn_tts_engine(
+                    app,
+                    &chat_tts_engine,
+                    translation_tts_engines,
+                ) {
+                    Ok(engine) => engine,
+                    Err(err) => {
+                        app.last_error = Some(err.to_string());
+                        continue;
+                    }
+                };
+
                 assistant_session = Some(begin_assistant_turn(
                     send_text.clone(),
+                    turn_request.messages,
+                    turn_request.sanitize_output,
                     app,
-                    convo,
                     &llm,
                     &tts_engine,
                     capture_enabled,
@@ -498,7 +883,11 @@ fn run_app(
                     args.debug,
                     debug_logs.clone(),
                 ));
-                pending_user_turn = Some(send_text);
+                pending_user_turn = if turn_request.remember_turn {
+                    Some(send_text)
+                } else {
+                    None
+                };
             }
         }
 
@@ -574,10 +963,109 @@ fn run_app(
                     continue;
                 }
 
+                if app.language_picker.is_some() {
+                    let mut dismiss_picker = false;
+                    let mut selection: Option<usize> = None;
+                    let picker_len = app.picker_len();
+
+                    {
+                        let picker = app
+                            .language_picker
+                            .as_mut()
+                            .expect("language_picker checked as Some");
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                break 'app_loop;
+                            }
+                            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                                break 'app_loop;
+                            }
+                            KeyCode::Up
+                            | KeyCode::Char('k')
+                                if key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT =>
+                            {
+                                if picker.selected == 0 {
+                                    picker.selected = picker_len.saturating_sub(1);
+                                } else {
+                                    picker.selected = picker.selected.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Down
+                            | KeyCode::Char('j')
+                                if key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT =>
+                            {
+                                picker.selected = (picker.selected + 1) % picker_len;
+                            }
+                            KeyCode::Enter => {
+                                selection = Some(picker.selected);
+                            }
+                            KeyCode::Esc => {
+                                dismiss_picker = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(selected_idx) = selection {
+                        if selected_idx == 0 {
+                            dismiss_picker = true;
+                            convo.clear();
+                            pending_user_turn = None;
+                            stt.reset();
+                            app.set_chat_mode();
+                        } else {
+                            let Some(option) = app.picker_option(selected_idx) else {
+                                continue;
+                            };
+                            if !option.is_enabled() {
+                                app.last_error = Some(format!(
+                                    "{} is disabled: missing Piper voice model/config in models/piper.",
+                                    option.label
+                                ));
+                                continue;
+                            }
+                            if !translation_tts_engines.contains_key(&option.target_language) {
+                                app.last_error = Some(format!(
+                                    "Voice for {} is unavailable. Check Piper model files.",
+                                    option.label
+                                ));
+                                continue;
+                            }
+
+                            dismiss_picker = true;
+                            convo.clear();
+                            pending_user_turn = None;
+                            stt.reset();
+                            app.set_translate_mode(option.target_language.clone());
+                        }
+                    }
+
+                    if dismiss_picker {
+                        app.language_picker = None;
+                    }
+
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    if assistant_session.is_some() {
+                        app.last_error =
+                            Some("Wait for the current response before changing mode.".to_string());
+                    } else {
+                        app.open_language_picker();
+                        app.last_error = None;
+                    }
+                    continue;
+                }
+
                 let action = handle_key_event(
                     key,
                     app,
                     assistant_session.is_some(),
+                    app.mode.is_chat(),
                     args.debug,
                     &debug_logs,
                 );
@@ -623,6 +1111,12 @@ fn run_app(
                 if key.code == KeyCode::Char('n')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
+                    if !app.mode.is_chat() {
+                        app.last_error =
+                            Some("Ctrl+N is only available in chat mode.".to_string());
+                        continue;
+                    }
+
                     if let Some(session) = assistant_session.as_ref() {
                         if args.debug {
                             debug_log(
@@ -656,6 +1150,13 @@ fn run_app(
                 }
 
                 if key.code == KeyCode::Enter {
+                    if !app.mode.is_chat() {
+                        app.last_error = Some(
+                            "Translate mode sends automatically from microphone input.".to_string(),
+                        );
+                        continue;
+                    }
+
                     let text = app.input.trim().to_string();
                     if text.is_empty() {
                         continue;
@@ -676,10 +1177,24 @@ fn run_app(
                         continue;
                     }
 
+                    let turn_request = build_turn_request(app, convo, &text);
+                    let tts_engine = match resolve_turn_tts_engine(
+                        app,
+                        &chat_tts_engine,
+                        translation_tts_engines,
+                    ) {
+                        Ok(engine) => engine,
+                        Err(err) => {
+                            app.last_error = Some(err.to_string());
+                            continue;
+                        }
+                    };
+
                     assistant_session = Some(begin_assistant_turn(
                         text.clone(),
+                        turn_request.messages,
+                        turn_request.sanitize_output,
                         app,
-                        convo,
                         &llm,
                         &tts_engine,
                         capture_enabled,
@@ -689,7 +1204,11 @@ fn run_app(
                         args.debug,
                         debug_logs.clone(),
                     ));
-                    pending_user_turn = Some(text);
+                    pending_user_turn = if turn_request.remember_turn {
+                        Some(text)
+                    } else {
+                        None
+                    };
                 }
             }
         }
@@ -708,6 +1227,7 @@ fn handle_key_event(
     key: KeyEvent,
     app: &mut AppState,
     assistant_busy: bool,
+    allow_manual_input: bool,
     debug: bool,
     debug_logs: &Arc<Mutex<Vec<String>>>,
 ) -> KeyAction {
@@ -754,8 +1274,10 @@ fn handle_key_event(
             }
         }
         KeyCode::Backspace => {
-            app.input.pop();
-            app.input_from_stt = false;
+            if allow_manual_input {
+                app.input.pop();
+                app.input_from_stt = false;
+            }
             app.last_esc_at = None;
         }
         KeyCode::Enter => {
@@ -763,8 +1285,10 @@ fn handle_key_event(
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             let _ = assistant_busy;
-            app.input.push(ch);
-            app.input_from_stt = false;
+            if allow_manual_input {
+                app.input.push(ch);
+                app.input_from_stt = false;
+            }
             app.last_esc_at = None;
         }
         _ => {
@@ -827,8 +1351,9 @@ fn request_tts_cancel(session: &AssistantSession, debug: bool, debug_logs: &Arc<
 #[allow(clippy::too_many_arguments)]
 fn begin_assistant_turn(
     user_text: String,
+    messages: Vec<ChatMessage>,
+    sanitize_output: bool,
     app: &mut AppState,
-    convo: &Conversation,
     llm: &Arc<LlmClient>,
     tts_engine: &Arc<TtsEngine>,
     capture_enabled: &Arc<AtomicBool>,
@@ -850,7 +1375,6 @@ fn begin_assistant_turn(
         debug_log(&debug_logs, "[assistant] new assistant turn started");
     }
 
-    let messages = convo.build_messages(&user_text);
     let (tx, rx) = mpsc::channel::<AssistantEvent>();
     let llm = Arc::clone(llm);
     let tts_engine = Arc::clone(tts_engine);
@@ -911,7 +1435,11 @@ fn begin_assistant_turn(
         let stream_result = llm.stream_chat(
             &messages,
             |delta| {
-                let clean = strip_visual_decorations(delta);
+                let clean = if sanitize_output {
+                    strip_visual_decorations(delta)
+                } else {
+                    delta.to_string()
+                };
                 if clean.is_empty() {
                     return Ok(());
                 }
@@ -1112,16 +1640,26 @@ fn render_ui(frame: &mut Frame, app: &AppState) {
     render_chat(frame, chunks[0], app);
     render_input(frame, chunks[1], app);
     render_status(frame, chunks[2], app);
+
+    if app.language_picker.is_some() {
+        render_language_picker(frame, app);
+    }
 }
 
 fn render_chat(frame: &mut Frame, area: Rect, app: &AppState) {
     let mut styled_lines: Vec<Line> = Vec::new();
     let mut plain_lines: Vec<String> = Vec::new();
 
+    let (user_label, assistant_label, panel_title) = if app.mode.is_chat() {
+        ("You", "Assistant", " Chat ")
+    } else {
+        ("Source", "Translation", " Translate ")
+    };
+
     for message in &app.messages {
         let (label, color) = match message.role {
-            MessageRole::User => ("You", Color::Cyan),
-            MessageRole::Assistant => ("Assistant", Color::Green),
+            MessageRole::User => (user_label, Color::Cyan),
+            MessageRole::Assistant => (assistant_label, Color::Green),
         };
 
         let first = format!("{label}: {}", message.content);
@@ -1137,19 +1675,25 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &AppState) {
     if app.assistant_active {
         if app.streaming_assistant.is_empty() {
             styled_lines.push(Line::from(vec![
-                Span::styled("Assistant: ", Style::default().fg(Color::Green).bold()),
+                Span::styled(
+                    format!("{assistant_label}: "),
+                    Style::default().fg(Color::Green).bold(),
+                ),
                 Span::styled("thinking...", Style::default().fg(Color::Yellow)),
             ]));
-            plain_lines.push("Assistant: thinking...".to_string());
+            plain_lines.push(format!("{assistant_label}: thinking..."));
         } else {
             styled_lines.push(Line::from(vec![
-                Span::styled("Assistant: ", Style::default().fg(Color::Green).bold()),
+                Span::styled(
+                    format!("{assistant_label}: "),
+                    Style::default().fg(Color::Green).bold(),
+                ),
                 Span::styled(
                     app.streaming_assistant.clone(),
                     Style::default().fg(Color::Green),
                 ),
             ]));
-            plain_lines.push(format!("Assistant: {}", app.streaming_assistant));
+            plain_lines.push(format!("{assistant_label}: {}", app.streaming_assistant));
         }
     }
 
@@ -1161,7 +1705,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &AppState) {
     let chat = Paragraph::new(Text::from(styled_lines))
         .block(
             Block::default()
-                .title(" Chat ")
+                .title(panel_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
@@ -1171,13 +1715,17 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
-    let title = if app.input_from_stt {
-        " Input (live STT + typing) "
+    let title = if app.mode.is_chat() {
+        if app.input_from_stt {
+            " Input (live STT + typing) "
+        } else {
+            " Input (type or speak) "
+        }
     } else {
-        " Input (type or speak) "
+        " Input (live STT, auto-send) "
     };
 
-    let input_style = if app.input_from_stt {
+    let input_style = if app.input_from_stt || !app.mode.is_chat() {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::White)
@@ -1199,13 +1747,15 @@ fn render_input(frame: &mut Frame, area: Rect, app: &AppState) {
         );
     frame.render_widget(input, area);
 
-    let cursor_x = area.x.saturating_add(1).saturating_add(cursor_col);
-    let cursor_y = area.y.saturating_add(1);
-    frame.set_cursor_position((cursor_x, cursor_y));
+    if app.mode.is_chat() {
+        let cursor_x = area.x.saturating_add(1).saturating_add(cursor_col);
+        let cursor_y = area.y.saturating_add(1);
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &AppState) {
-    let mode = Span::styled(
+    let duplex_mode = Span::styled(
         format!(" {} ", app.duplex_state.label()),
         Style::default()
             .fg(Color::Black)
@@ -1213,24 +1763,45 @@ fn render_status(frame: &mut Frame, area: Rect, app: &AppState) {
             .bold(),
     );
 
+    let function_mode = Span::styled(
+        format!(" {} ", app.mode.function_label()),
+        Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+    );
+
     let mut lines = vec![Line::from(vec![
-        Span::raw("Mode: "),
-        mode,
+        Span::raw("Duplex: "),
+        duplex_mode,
+        Span::raw("  Function: "),
+        function_mode,
         Span::raw("  Mic: "),
         Span::styled(&app.mic_name, Style::default().fg(Color::Cyan)),
     ])];
 
-    lines.push(Line::from(vec![
-        Span::raw("Controls: "),
-        Span::styled("Enter", Style::default().fg(Color::White).bold()),
-        Span::raw(" send  "),
-        Span::styled("Ctrl+N", Style::default().fg(Color::White).bold()),
-        Span::raw(" new chat  "),
-        Span::styled("Esc", Style::default().fg(Color::White).bold()),
-        Span::raw(" clear  "),
-        Span::styled("q", Style::default().fg(Color::White).bold()),
-        Span::raw(" quit"),
-    ]));
+    if app.mode.is_chat() {
+        lines.push(Line::from(vec![
+            Span::raw("Controls: "),
+            Span::styled("Enter", Style::default().fg(Color::White).bold()),
+            Span::raw(" send  "),
+            Span::styled("Ctrl+T", Style::default().fg(Color::White).bold()),
+            Span::raw(" translate  "),
+            Span::styled("Ctrl+N", Style::default().fg(Color::White).bold()),
+            Span::raw(" new chat  "),
+            Span::styled("Esc", Style::default().fg(Color::White).bold()),
+            Span::raw(" clear  "),
+            Span::styled("q", Style::default().fg(Color::White).bold()),
+            Span::raw(" quit"),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("Controls: "),
+            Span::styled("Ctrl+T", Style::default().fg(Color::White).bold()),
+            Span::raw(" choose target  "),
+            Span::styled("Esc", Style::default().fg(Color::White).bold()),
+            Span::raw(" clear draft  "),
+            Span::styled("q", Style::default().fg(Color::White).bold()),
+            Span::raw(" quit"),
+        ]));
+    }
 
     if let Some(err) = &app.last_error {
         lines.push(Line::from(vec![
@@ -1251,6 +1822,78 @@ fn render_status(frame: &mut Frame, area: Rect, app: &AppState) {
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     frame.render_widget(status, area);
+}
+
+fn render_language_picker(frame: &mut Frame, app: &AppState) {
+    let Some(picker) = app.language_picker.as_ref() else {
+        return;
+    };
+
+    let popup_area = centered_rect(frame.area(), 64, 70);
+    frame.render_widget(Clear, popup_area);
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.picker_len());
+    items.push(ListItem::new(PICKER_BACK_TO_CHAT));
+    for option in &app.translation_options {
+        let line = if option.is_enabled() {
+            let model = option
+                .voice_model
+                .as_ref()
+                .expect("enabled translation option has model");
+            let model_name = model
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("voice.onnx");
+            format!("{} ({model_name})", option.label)
+        } else if option.voice_model.is_some() && option.voice_config.is_none() {
+            format!("{} (disabled: missing .onnx.json)", option.label)
+        } else {
+            format!("{} (disabled: no voice)", option.label)
+        };
+
+        let item = if option.is_enabled() {
+            ListItem::new(line)
+        } else {
+            ListItem::new(Line::from(vec![Span::styled(
+                line,
+                Style::default().fg(Color::DarkGray),
+            )]))
+        };
+        items.push(item);
+    }
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow).bold())
+        .highlight_symbol("-> ")
+        .block(
+            Block::default()
+                .title(" Translate Target (Ctrl+T, Enter select, Esc close) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White)),
+        );
+
+    let mut state = ListState::default();
+    state.select(Some(picker.selected));
+    frame.render_stateful_widget(list, popup_area, &mut state);
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn estimate_wrapped_lines(lines: &[String], width: usize) -> usize {
