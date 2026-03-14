@@ -1,5 +1,5 @@
 use crate::chat::ChatMessage;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -35,9 +35,15 @@ impl LlmClient {
         })
     }
 
-    pub fn stream_chat<F>(&self, messages: &[ChatMessage], mut on_delta: F) -> Result<String>
+    pub fn stream_chat<F, C>(
+        &self,
+        messages: &[ChatMessage],
+        mut on_delta: F,
+        should_cancel: C,
+    ) -> Result<String>
     where
         F: FnMut(&str) -> Result<()>,
+        C: Fn() -> bool,
     {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = json!({
@@ -70,12 +76,20 @@ impl LlmClient {
         let mut full = String::new();
 
         loop {
+            if should_cancel() {
+                return Err(anyhow!("cancelled by user"));
+            }
+
             line.clear();
             let n = reader
                 .read_line(&mut line)
                 .context("Failed to read LLM stream")?;
             if n == 0 {
                 break;
+            }
+
+            if should_cancel() {
+                return Err(anyhow!("cancelled by user"));
             }
 
             let trimmed = line.trim();

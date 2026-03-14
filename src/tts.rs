@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub enum PlayerKind {
@@ -119,6 +121,7 @@ impl TtsEngine {
             piper_child: Some(piper_child),
             player_child: Some(player_child),
             chunker: SentenceChunker::new(120),
+            cancelled: false,
         })
     }
 }
@@ -128,17 +131,29 @@ pub struct TtsSession {
     piper_child: Option<Child>,
     player_child: Option<Child>,
     chunker: SentenceChunker,
+    cancelled: bool,
 }
 
 impl TtsSession {
     pub fn push_text(&mut self, text: &str) -> Result<()> {
+        if self.cancelled {
+            return Ok(());
+        }
+
         for chunk in self.chunker.push(text) {
             self.send_chunk(&chunk)?;
         }
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<()> {
+    pub fn finish_with_cancel<F>(&mut self, should_cancel: F) -> Result<()>
+    where
+        F: Fn() -> bool,
+    {
+        if self.cancelled {
+            return Ok(());
+        }
+
         if let Some(last) = self.chunker.finish() {
             self.send_chunk(&last)?;
         }
@@ -148,26 +163,51 @@ impl TtsSession {
             drop(stdin);
         }
 
-        if let Some(mut piper_child) = self.piper_child.take() {
-            let status = piper_child.wait().context("Failed waiting for piper")?;
-            if !status.success() {
-                anyhow::bail!("Piper process exited with status {status}");
-            }
-        }
-
-        if let Some(mut player_child) = self.player_child.take() {
-            let status = player_child
-                .wait()
-                .context("Failed waiting for playback process")?;
-            if !status.success() {
-                anyhow::bail!("Playback process exited with status {status}");
-            }
-        }
+        Self::wait_child_with_cancel(
+            &mut self.piper_child,
+            &mut self.cancelled,
+            "piper",
+            &should_cancel,
+        )?;
+        Self::wait_child_with_cancel(
+            &mut self.player_child,
+            &mut self.cancelled,
+            "playback",
+            &should_cancel,
+        )?;
 
         Ok(())
     }
 
+    pub fn cancel(&mut self) {
+        if self.cancelled {
+            return;
+        }
+
+        self.cancelled = true;
+        self.chunker.finish();
+
+        if let Some(mut stdin) = self.piper_stdin.take() {
+            stdin.flush().ok();
+            drop(stdin);
+        }
+
+        if let Some(mut piper_child) = self.piper_child.take() {
+            piper_child.kill().ok();
+            piper_child.wait().ok();
+        }
+
+        if let Some(mut player_child) = self.player_child.take() {
+            player_child.kill().ok();
+            player_child.wait().ok();
+        }
+    }
+
     fn send_chunk(&mut self, chunk: &str) -> Result<()> {
+        if self.cancelled {
+            return Ok(());
+        }
+
         if chunk.trim().is_empty() {
             return Ok(());
         }
@@ -184,6 +224,42 @@ impl TtsSession {
             .context("Failed writing newline to piper")?;
         stdin.flush().context("Failed flushing piper stdin")?;
         Ok(())
+    }
+
+    fn wait_child_with_cancel<F>(
+        child_slot: &mut Option<Child>,
+        cancelled: &mut bool,
+        child_name: &str,
+        should_cancel: &F,
+    ) -> Result<()>
+    where
+        F: Fn() -> bool,
+    {
+        let Some(mut child) = child_slot.take() else {
+            return Ok(());
+        };
+
+        loop {
+            if *cancelled || should_cancel() {
+                *cancelled = true;
+                child.kill().ok();
+                child.wait().ok();
+                return Ok(());
+            }
+
+            match child
+                .try_wait()
+                .with_context(|| format!("Failed waiting for {child_name} process"))?
+            {
+                Some(status) => {
+                    if !status.success() {
+                        anyhow::bail!("{child_name} process exited with status {status}");
+                    }
+                    return Ok(());
+                }
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 }
 

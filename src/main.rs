@@ -22,11 +22,12 @@ use std::io::{stdout, Stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use stt::{SttConfig, SttEngine, SttUpdate};
-use tts::{PlayerKind, TtsConfig, TtsEngine};
+use tts::{PlayerKind, TtsConfig, TtsEngine, TtsSession};
 
 const DEFAULT_SYSTEM_PROMPT_EU: &str = r#"Audio bidezko elkarrizketa batean zaude, euskaraz.
 
@@ -56,6 +57,8 @@ const MAX_UI_MESSAGES: usize = 300;
 const NEW_CHAT_BANNER: &str = "Txat berria hasi da. Hitz egin edo idatzi mezua eta sakatu Enter.";
 const ECHO_GUARD_WINDOW: Duration = Duration::from_secs(12);
 const ECHO_GUARD_MIN_CHARS: usize = 10;
+const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(600);
+static DEBUG_LOGS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DuplexState {
@@ -203,6 +206,7 @@ struct AppState {
     openai_base_url: String,
     last_assistant_text: String,
     last_assistant_at: Option<Instant>,
+    last_esc_at: Option<Instant>,
 }
 
 impl AppState {
@@ -219,6 +223,7 @@ impl AppState {
             openai_base_url,
             last_assistant_text: String::new(),
             last_assistant_at: None,
+            last_esc_at: None,
         }
     }
 
@@ -253,6 +258,7 @@ impl AppState {
         self.last_error = None;
         self.last_assistant_text.clear();
         self.last_assistant_at = None;
+        self.last_esc_at = None;
         self.push_message(MessageRole::Assistant, NEW_CHAT_BANNER.to_string());
     }
 }
@@ -264,8 +270,16 @@ enum AssistantEvent {
     Failed(String),
 }
 
+struct AssistantSession {
+    events: Receiver<AssistantEvent>,
+    cancel_tts: Arc<AtomicBool>,
+    cancel_llm: Arc<AtomicBool>,
+    tts_session: Arc<Mutex<Option<TtsSession>>>,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    let debug_logs = init_debug_logs(args.debug);
 
     if args.provider != "cpu" && args.provider != "cuda" {
         anyhow::bail!("--provider must be 'cpu' or 'cuda'");
@@ -350,6 +364,7 @@ fn main() -> Result<()> {
         &capture_enabled,
         &audio_stream,
         &rx_audio,
+        debug_logs.clone(),
     );
     let restore_result = restore_terminal(&mut terminal);
     drop(audio_stream);
@@ -358,7 +373,53 @@ fn main() -> Result<()> {
         eprintln!("[latxaudio] Failed to restore terminal: {e}");
     }
 
+    flush_debug_logs(args.debug, debug_logs);
+
     run_result
+}
+
+fn init_debug_logs(debug: bool) -> Arc<Mutex<Vec<String>>> {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    if debug {
+        let _ = DEBUG_LOGS.set(logs.clone());
+    }
+    logs
+}
+
+fn debug_log(logs: &Arc<Mutex<Vec<String>>>, message: impl Into<String>) {
+    if let Ok(mut guard) = logs.lock() {
+        guard.push(message.into());
+    }
+}
+
+fn debug_log_global(message: impl Into<String>) {
+    if let Some(logs) = DEBUG_LOGS.get() {
+        debug_log(logs, message);
+    }
+}
+
+fn flush_debug_logs(debug: bool, logs: Arc<Mutex<Vec<String>>>) {
+    if !debug {
+        return;
+    }
+
+    let entries = match logs.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            eprintln!("[debug] failed to collect debug logs (lock poisoned)");
+            return;
+        }
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    eprintln!("\n--- latxaudio debug log ---");
+    for line in entries {
+        eprintln!("{line}");
+    }
+    eprintln!("--- end debug log ---");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,8 +436,9 @@ fn run_app(
     capture_enabled: &Arc<AtomicBool>,
     audio_stream: &cpal::Stream,
     rx_audio: &Receiver<Vec<f32>>,
+    debug_logs: Arc<Mutex<Vec<String>>>,
 ) -> Result<()> {
-    let mut assistant_events: Option<Receiver<AssistantEvent>> = None;
+    let mut assistant_session: Option<AssistantSession> = None;
     let mut pending_user_turn: Option<String> = None;
 
     loop {
@@ -400,7 +462,7 @@ fn run_app(
             }
 
             if let Some(final_text) = final_text {
-                if assistant_events.is_some() {
+                if assistant_session.is_some() {
                     continue;
                 }
 
@@ -423,7 +485,7 @@ fn run_app(
                     continue;
                 }
 
-                assistant_events = Some(begin_assistant_turn(
+                assistant_session = Some(begin_assistant_turn(
                     send_text.clone(),
                     app,
                     convo,
@@ -434,6 +496,7 @@ fn run_app(
                     stt,
                     rx_audio,
                     args.debug,
+                    debug_logs.clone(),
                 ));
                 pending_user_turn = Some(send_text);
             }
@@ -442,9 +505,9 @@ fn run_app(
         let mut completed_text: Option<String> = None;
         let mut failed_text: Option<String> = None;
 
-        if let Some(worker_rx) = assistant_events.as_ref() {
+        if let Some(session) = assistant_session.as_ref() {
             loop {
-                match worker_rx.try_recv() {
+                match session.events.try_recv() {
                     Ok(event) => match event {
                         AssistantEvent::SpeakingStarted => {
                             set_duplex_state(&mut app.duplex_state, DuplexState::Speaking, args.debug);
@@ -484,7 +547,7 @@ fn run_app(
                 args.post_tts_mute_ms,
                 args.debug,
             );
-            assistant_events = None;
+            assistant_session = None;
         }
 
         if let Some(text) = completed_text {
@@ -500,7 +563,7 @@ fn run_app(
                 args.post_tts_mute_ms,
                 args.debug,
             );
-            assistant_events = None;
+            assistant_session = None;
         }
 
         terminal.draw(|frame| render_ui(frame, app))?;
@@ -511,14 +574,56 @@ fn run_app(
                     continue;
                 }
 
-                if handle_key_event(key, app, assistant_events.is_some()) {
+                let action = handle_key_event(
+                    key,
+                    app,
+                    assistant_session.is_some(),
+                    args.debug,
+                    &debug_logs,
+                );
+                if action.quit {
+                    if let Some(session) = assistant_session.as_ref() {
+                        if args.debug {
+                            debug_log(
+                                &debug_logs,
+                                "[input] Quit requested -> cancel TTS and LLM before exit",
+                            );
+                        }
+                        session.cancel_llm.store(true, Ordering::SeqCst);
+                        request_tts_cancel(session, args.debug, &debug_logs);
+                    }
                     break;
+                }
+
+                if action.cancel_tts {
+                    if let Some(session) = assistant_session.as_ref() {
+                        if args.debug {
+                            debug_log(&debug_logs, "[input] ESC pressed -> request TTS cancel");
+                        }
+                        request_tts_cancel(session, args.debug, &debug_logs);
+                        app.last_error = Some("TTS playback interrupted by user (Esc).".to_string());
+                    }
+                }
+
+                if action.cancel_llm {
+                    if let Some(session) = assistant_session.as_ref() {
+                        if args.debug {
+                            debug_log(
+                                &debug_logs,
+                                "[input] Double ESC detected -> request LLM cancel",
+                            );
+                        }
+                        session.cancel_llm.store(true, Ordering::SeqCst);
+                        request_tts_cancel(session, args.debug, &debug_logs);
+                        app.last_error =
+                            Some("Assistant response cancelled by user (Esc Esc).".to_string());
+                    }
                 }
 
                 if key.code == KeyCode::Char('n')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    if assistant_events.is_some() {
+                    if assistant_session.is_some() {
                         app.last_error = Some(
                             "Assistant is still responding. Wait, then start a new chat."
                                 .to_string(),
@@ -548,13 +653,13 @@ fn run_app(
                         continue;
                     }
 
-                    if assistant_events.is_some() {
+                    if assistant_session.is_some() {
                         app.last_error =
                             Some("Assistant is still responding. Wait a moment.".to_string());
                         continue;
                     }
 
-                    assistant_events = Some(begin_assistant_turn(
+                    assistant_session = Some(begin_assistant_turn(
                         text.clone(),
                         app,
                         convo,
@@ -565,6 +670,7 @@ fn run_app(
                         stt,
                         rx_audio,
                         args.debug,
+                        debug_logs.clone(),
                     ));
                     pending_user_turn = Some(text);
                 }
@@ -575,27 +681,129 @@ fn run_app(
     Ok(())
 }
 
-fn handle_key_event(key: KeyEvent, app: &mut AppState, assistant_busy: bool) -> bool {
+struct KeyAction {
+    quit: bool,
+    cancel_tts: bool,
+    cancel_llm: bool,
+}
+
+fn handle_key_event(
+    key: KeyEvent,
+    app: &mut AppState,
+    assistant_busy: bool,
+    debug: bool,
+    debug_logs: &Arc<Mutex<Vec<String>>>,
+) -> KeyAction {
+    let mut action = KeyAction {
+        quit: false,
+        cancel_tts: false,
+        cancel_llm: false,
+    };
+
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-        KeyCode::Char('q') if key.modifiers.is_empty() => true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            action.quit = true;
+        }
+        KeyCode::Char('q') if key.modifiers.is_empty() => {
+            action.quit = true;
+        }
         KeyCode::Esc => {
             app.clear_input();
-            false
+            if assistant_busy {
+                let now = Instant::now();
+                let double_esc = app
+                    .last_esc_at
+                    .map(|last| now.saturating_duration_since(last) <= DOUBLE_ESC_WINDOW)
+                    .unwrap_or(false);
+
+                action.cancel_tts = true;
+                action.cancel_llm = double_esc;
+                app.last_esc_at = Some(now);
+                if debug {
+                    if double_esc {
+                        debug_log(
+                            debug_logs,
+                            format!("[input] ESC pressed (double within {:?})", DOUBLE_ESC_WINDOW),
+                        );
+                    } else {
+                        debug_log(debug_logs, "[input] ESC pressed (single)");
+                    }
+                }
+            } else {
+                app.last_esc_at = None;
+                if debug {
+                    debug_log(debug_logs, "[input] ESC pressed while assistant idle (input cleared)");
+                }
+            }
         }
         KeyCode::Backspace => {
             app.input.pop();
             app.input_from_stt = false;
-            false
+            app.last_esc_at = None;
         }
-        KeyCode::Enter => false,
+        KeyCode::Enter => {
+            app.last_esc_at = None;
+        }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             let _ = assistant_busy;
             app.input.push(ch);
             app.input_from_stt = false;
-            false
+            app.last_esc_at = None;
         }
-        _ => false,
+        _ => {
+            app.last_esc_at = None;
+        }
+    }
+
+    action
+}
+
+fn request_tts_cancel(session: &AssistantSession, debug: bool, debug_logs: &Arc<Mutex<Vec<String>>>) {
+    session.cancel_tts.store(true, Ordering::SeqCst);
+    if debug {
+        debug_log(debug_logs, "[cancel] cancel_tts flag set");
+    }
+
+    match session.tts_session.try_lock() {
+        Ok(mut guard) => {
+            if debug {
+                debug_log(debug_logs, "[cancel] acquired tts_session lock immediately");
+            }
+            if let Some(mut tts_session) = guard.take() {
+                if debug {
+                    debug_log(debug_logs, "[cancel] cancelling active TTS session now");
+                }
+                tts_session.cancel();
+            } else if debug {
+                debug_log(debug_logs, "[cancel] no active TTS session to cancel");
+            }
+        }
+        Err(TryLockError::WouldBlock) => {
+            if debug {
+                debug_log(debug_logs, "[cancel] tts_session lock busy, scheduling async cancel");
+            }
+            let tts_session = Arc::clone(&session.tts_session);
+            let debug_logs = debug_logs.clone();
+            thread::spawn(move || {
+                if let Ok(mut guard) = tts_session.lock() {
+                    if let Some(mut tts_session) = guard.take() {
+                        if debug {
+                            debug_log(&debug_logs, "[cancel] async path acquired lock, cancelling TTS session");
+                        }
+                        tts_session.cancel();
+                    } else if debug {
+                        debug_log(&debug_logs, "[cancel] async path found no active TTS session");
+                    }
+                } else if debug {
+                    debug_log(&debug_logs, "[cancel] async path failed to lock tts_session (poisoned)");
+                }
+            });
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            if debug {
+                debug_log(debug_logs, "[cancel] tts_session lock poisoned");
+            }
+        }
     }
 }
 
@@ -611,7 +819,8 @@ fn begin_assistant_turn(
     stt: &mut SttEngine,
     rx_audio: &Receiver<Vec<f32>>,
     debug: bool,
-) -> Receiver<AssistantEvent> {
+    debug_logs: Arc<Mutex<Vec<String>>>,
+) -> AssistantSession {
     app.last_error = None;
     app.push_message(MessageRole::User, user_text.clone());
     app.streaming_assistant.clear();
@@ -620,57 +829,193 @@ fn begin_assistant_turn(
 
     set_duplex_state(&mut app.duplex_state, DuplexState::Thinking, debug);
     enter_assistant_turn(capture_enabled, audio_stream, stt, rx_audio);
+    if debug {
+        debug_log(&debug_logs, "[assistant] new assistant turn started");
+    }
 
     let messages = convo.build_messages(&user_text);
     let (tx, rx) = mpsc::channel::<AssistantEvent>();
     let llm = Arc::clone(llm);
     let tts_engine = Arc::clone(tts_engine);
+    let cancel_tts = Arc::new(AtomicBool::new(false));
+    let cancel_llm = Arc::new(AtomicBool::new(false));
+    let cancel_tts_worker = Arc::clone(&cancel_tts);
+    let cancel_llm_worker = Arc::clone(&cancel_llm);
+    let tts_session = Arc::new(Mutex::new(None::<TtsSession>));
+    let tts_session_worker = Arc::clone(&tts_session);
+    let debug_logs_worker = debug_logs.clone();
 
     thread::spawn(move || {
         let mut speaking_started = false;
         let mut cleaned_full = String::new();
+        if debug {
+            debug_log(&debug_logs_worker, "[assistant] worker thread started");
+        }
 
-        match tts_engine.start_session() {
-            Ok(mut tts_session) => {
-                let stream_result = llm.stream_chat(&messages, |delta| {
-                    let clean = strip_visual_decorations(delta);
-                    if clean.is_empty() {
-                        return Ok(());
-                    }
-
-                    if !speaking_started {
-                        speaking_started = true;
-                        let _ = tx.send(AssistantEvent::SpeakingStarted);
-                    }
-
-                    cleaned_full.push_str(&clean);
-                    let _ = tx.send(AssistantEvent::Delta(clean.clone()));
-                    tts_session.push_text(&clean)
-                });
-
-                let finish_result = tts_session.finish();
-
-                match (stream_result, finish_result) {
-                    (Ok(_), Ok(())) => {
-                        let _ = tx.send(AssistantEvent::Completed(cleaned_full));
-                    }
-                    (Err(e), _) => {
-                        let _ = tx.send(AssistantEvent::Failed(format!("[llm] streaming failed: {e}")));
-                    }
-                    (_, Err(e)) => {
-                        let _ = tx.send(AssistantEvent::Failed(format!("[tts] playback failed: {e}")));
-                    }
-                }
-            }
+        let session = match tts_engine.start_session() {
+            Ok(session) => session,
             Err(e) => {
+                if debug {
+                    debug_log(
+                        &debug_logs_worker,
+                        format!("[assistant] failed to start TTS session: {e}"),
+                    );
+                }
                 let _ = tx.send(AssistantEvent::Failed(format!(
                     "[tts] failed to start session: {e}"
                 )));
+                return;
+            }
+        };
+        if debug {
+            debug_log(&debug_logs_worker, "[assistant] TTS session started");
+        }
+
+        if let Ok(mut guard) = tts_session_worker.lock() {
+            *guard = Some(session);
+            if debug {
+                debug_log(&debug_logs_worker, "[assistant] published shared TTS session handle");
+            }
+        } else {
+            if debug {
+                debug_log(
+                    &debug_logs_worker,
+                    "[assistant] tts_session lock poisoned while publishing",
+                );
+            }
+            let _ = tx.send(AssistantEvent::Failed("[tts] session lock poisoned".to_string()));
+            return;
+        }
+
+        let tx_stream = tx.clone();
+        if debug {
+            debug_log(&debug_logs_worker, "[assistant] starting LLM streaming");
+        }
+        let stream_result = llm.stream_chat(
+            &messages,
+            |delta| {
+                let clean = strip_visual_decorations(delta);
+                if clean.is_empty() {
+                    return Ok(());
+                }
+
+                if !speaking_started {
+                    speaking_started = true;
+                    let _ = tx_stream.send(AssistantEvent::SpeakingStarted);
+                }
+
+                cleaned_full.push_str(&clean);
+                let _ = tx_stream.send(AssistantEvent::Delta(clean.clone()));
+
+                if cancel_tts_worker.load(Ordering::SeqCst) {
+                    if debug {
+                        debug_log(
+                            &debug_logs_worker,
+                            "[assistant] delta received but TTS already cancelled",
+                        );
+                    }
+                    return Ok(());
+                }
+
+                let mut guard = tts_session_worker
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("[tts] session lock poisoned"))?;
+                if let Some(session) = guard.as_mut() {
+                    session.push_text(&clean)?;
+                }
+                Ok(())
+            },
+            || cancel_llm_worker.load(Ordering::SeqCst),
+        );
+        if debug {
+            match &stream_result {
+                Ok(_) => debug_log(&debug_logs_worker, "[assistant] LLM streaming completed"),
+                Err(e) => debug_log(
+                    &debug_logs_worker,
+                    format!("[assistant] LLM streaming finished with error: {e}"),
+                ),
+            }
+        }
+
+        let finish_result = {
+            let mut guard = match tts_session_worker.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    let _ = tx.send(AssistantEvent::Failed("[tts] session lock poisoned".to_string()));
+                    return;
+                }
+            };
+
+            if let Some(mut session) = guard.take() {
+                if cancel_tts_worker.load(Ordering::SeqCst) || cancel_llm_worker.load(Ordering::SeqCst) {
+                    if debug {
+                        debug_log(
+                            &debug_logs_worker,
+                            "[assistant] cancellation flag active, aborting TTS session",
+                        );
+                    }
+                    session.cancel();
+                    Ok(())
+                } else {
+                    if debug {
+                        debug_log(&debug_logs_worker, "[assistant] finishing TTS session normally");
+                    }
+                    drop(guard);
+                    let finish = session.finish_with_cancel(|| {
+                        cancel_tts_worker.load(Ordering::SeqCst)
+                            || cancel_llm_worker.load(Ordering::SeqCst)
+                    });
+                    if cancel_tts_worker.load(Ordering::SeqCst)
+                        || cancel_llm_worker.load(Ordering::SeqCst)
+                    {
+                        if debug {
+                            debug_log(
+                                &debug_logs_worker,
+                                "[assistant] cancellation requested during finish_with_cancel",
+                            );
+                        }
+                    }
+                    finish
+                }
+            } else {
+                if debug {
+                    debug_log(&debug_logs_worker, "[assistant] no TTS session found during finalize");
+                }
+                Ok(())
+            }
+        };
+        if debug {
+            match &finish_result {
+                Ok(_) => debug_log(&debug_logs_worker, "[assistant] TTS finalize completed"),
+                Err(e) => debug_log(
+                    &debug_logs_worker,
+                    format!("[assistant] TTS finalize failed: {e}"),
+                ),
+            }
+        }
+
+        match (stream_result, finish_result) {
+            (_, Err(e)) => {
+                let _ = tx.send(AssistantEvent::Failed(format!("[tts] playback failed: {e}")));
+            }
+            (Err(_), Ok(())) if cancel_llm_worker.load(Ordering::SeqCst) => {
+                let _ = tx.send(AssistantEvent::Completed(cleaned_full));
+            }
+            (Ok(_), Ok(())) => {
+                let _ = tx.send(AssistantEvent::Completed(cleaned_full));
+            }
+            (Err(e), Ok(())) => {
+                let _ = tx.send(AssistantEvent::Failed(format!("[llm] streaming failed: {e}")));
             }
         }
     });
 
-    rx
+    AssistantSession {
+        events: rx,
+        cancel_tts,
+        cancel_llm,
+        tts_session,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1069,6 +1414,7 @@ fn enter_assistant_turn(
     capture_enabled.store(false, Ordering::Release);
     if let Err(e) = audio_stream.pause() {
         eprintln!("[audio] warning: failed to pause mic stream: {e}");
+        debug_log_global(format!("[audio] warning: failed to pause mic stream: {e}"));
     }
 
     stt.reset();
@@ -1087,7 +1433,7 @@ fn exit_assistant_turn(
 ) {
     if post_tts_mute_ms > 0 {
         if debug {
-            eprintln!("[audio] post-tts mute cooldown: {} ms", post_tts_mute_ms);
+            debug_log_global(format!("[audio] post-tts mute cooldown: {} ms", post_tts_mute_ms));
         }
         thread::sleep(Duration::from_millis(post_tts_mute_ms));
     }
@@ -1100,6 +1446,7 @@ fn exit_assistant_turn(
     capture_enabled.store(true, Ordering::Release);
     if let Err(e) = audio_stream.play() {
         eprintln!("[audio] warning: failed to resume mic stream: {e}");
+        debug_log_global(format!("[audio] warning: failed to resume mic stream: {e}"));
     }
 }
 
@@ -1109,7 +1456,7 @@ fn set_duplex_state(state: &mut DuplexState, next: DuplexState, debug: bool) {
     }
 
     if debug {
-        eprintln!("[duplex] {:?} -> {:?}", *state, next);
+        debug_log_global(format!("[duplex] {:?} -> {:?}", *state, next));
     }
     *state = next;
 }
