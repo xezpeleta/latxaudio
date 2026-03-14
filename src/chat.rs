@@ -56,4 +56,8 @@ impl Conversation {
             self.history.remove(0);
         }
     }
+
+    pub fn clear(&mut self) {
+        self.history.clear();
+    }
 }

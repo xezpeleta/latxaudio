@@ -15,9 +15,13 @@ Additionally, streamed assistant text is sanitized at runtime to remove common e
 
 ## Features
 
-- Real-time microphone transcription with partial updates
+- Full-screen TUI with dedicated chat, input, and status panels
+- Clear user/assistant separation with different colors in chat history
+- Real-time microphone transcription that is injected into the editable input box
+- Manual typing support in the same input box before sending to LLM
+- Live state indicator: listening, thinking, speaking
 - Final utterance detection with Silero VAD
-- Streaming assistant tokens printed immediately
+- Streaming assistant tokens rendered immediately in chat while TTS plays
 - Incremental TTS chunking to start playback before full response is finished
 - OpenAI default endpoint with configurable base URL for local/remote compatible servers
 
@@ -93,6 +97,19 @@ Run:
 ```bash
 ./run.sh
 ```
+
+When running, the TUI opens in alternate-screen mode with three areas:
+
+- Chat panel: conversation history and live assistant stream
+- Input panel: live STT draft + editable typing area
+- Status panel: mode badge and runtime hints
+
+Keyboard controls:
+
+- `Enter`: send current input to the assistant
+- `Ctrl+N`: start a new chat (clears current conversation and input)
+- `Esc`: clear current input
+- `q` or `Ctrl+C`: quit
 
 Use a custom OpenAI-compatible endpoint:
 

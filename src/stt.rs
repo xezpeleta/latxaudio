@@ -1,8 +1,8 @@
 use crate::audio::{TARGET_SAMPLE_RATE, VAD_WINDOW_SIZE};
 use anyhow::{Context, Result};
 use sherpa_onnx::{
-    DisplayManager, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig, SileroVadModelConfig,
+    VadModelConfig, VoiceActivityDetector,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -24,11 +24,16 @@ pub struct SttConfig {
 pub struct SttEngine {
     vad: VoiceActivityDetector,
     recognizer: OfflineRecognizer,
-    display: DisplayManager,
     buffer: Vec<f32>,
     offset: usize,
     speech_started: bool,
     partial_timer: Instant,
+    last_partial: String,
+}
+
+pub struct SttUpdate {
+    pub partial: Option<String>,
+    pub final_text: Option<String>,
 }
 
 impl SttEngine {
@@ -95,16 +100,17 @@ impl SttEngine {
         Ok(Self {
             vad,
             recognizer,
-            display: DisplayManager::new(),
             buffer: Vec::new(),
             offset: 0,
             speech_started: false,
             partial_timer: Instant::now(),
+            last_partial: String::new(),
         })
     }
 
-    pub fn accept_audio(&mut self, chunk_16k_mono: &[f32]) -> Option<String> {
+    pub fn accept_audio(&mut self, chunk_16k_mono: &[f32]) -> SttUpdate {
         self.buffer.extend_from_slice(chunk_16k_mono);
+        let mut partial_update: Option<String> = None;
 
         while self.offset + VAD_WINDOW_SIZE <= self.buffer.len() {
             self.vad
@@ -131,8 +137,11 @@ impl SttEngine {
 
             if let Some(result) = asr_stream.get_result() {
                 if !result.text.is_empty() {
-                    self.display.update_text(&result.text);
-                    self.display.render();
+                    let partial = result.text.trim().to_string();
+                    if !partial.is_empty() && partial != self.last_partial {
+                        self.last_partial = partial.clone();
+                        partial_update = Some(partial);
+                    }
                 }
             }
 
@@ -159,17 +168,20 @@ impl SttEngine {
             self.buffer.clear();
             self.offset = 0;
             self.speech_started = false;
+            self.last_partial.clear();
         }
 
         if let Some(final_text) = best_text {
-            self.display.update_text(&final_text);
-            self.display.finalize_sentence();
-            self.display.render();
-
-            return Some(final_text);
+            return SttUpdate {
+                partial: Some(final_text.clone()),
+                final_text: Some(final_text),
+            };
         }
 
-        None
+        SttUpdate {
+            partial: partial_update,
+            final_text: None,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -177,6 +189,7 @@ impl SttEngine {
         self.offset = 0;
         self.speech_started = false;
         self.partial_timer = Instant::now();
+        self.last_partial.clear();
         while self.vad.front().is_some() {
             self.vad.pop();
         }
