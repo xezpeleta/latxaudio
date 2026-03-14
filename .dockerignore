@@ -1,0 +1,7 @@
+models/
+dist/
+target/
+
+.git/
+.idea/
+.vscode/

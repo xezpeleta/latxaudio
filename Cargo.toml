@@ -1,0 +1,20 @@
+[package]
+name = "latxaudio"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time Basque speech-to-chat CLI with Parakeet STT, streaming OpenAI-compatible LLM, and Piper TTS"
+license = "MIT"
+
+[[bin]]
+name = "latxaudio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+cpal = "0.16"
+ctrlc = { version = "3", features = ["termination"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = "0.1.9"

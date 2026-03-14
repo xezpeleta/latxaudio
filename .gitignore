@@ -1,0 +1,14 @@
+/target/
+/dist/
+/models/
+
+# Environment and local overrides
+.env
+.env.*
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
