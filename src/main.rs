@@ -37,13 +37,15 @@ Interpretatu intentzio probableena eta erantzun lagungarri.
 Debekatuta daude emotikonoak, emojiak eta apaingarri tipografikoak.
 Debekatuta daude, gainera, markdown formatu ikurrak (adibidez: *, _, `, #, >, |, ~, [, ]).
 Ez erabili inoiz ikur edo formatu horiek erantzunean.
+Debekatuta daude neurri-unitateen laburdurak erantzunetan (bereziki: m/s, km/h, km, kg, cm, mm).
+Idatzi beti unitateak hitzez eta lokuziorako prest (adibidez: metro segunduko, kilometro orduko, kilometro, kilogramo).
 </IMPORTANT>
 
 Erantzun arauak:
 - Beti euskaraz.
 - Labur eta zuzenean; lehenengo esaldian ideia nagusia.
 - Ahots bidez irakurriko da: esaldi naturalak eta erraz ahoskatzekoak.
-- Neurri-unitateen laburdurak ez erabili (km, m/s, kg...): idatzi hitzez, lokuziorako prest (kilometro, metro segunduko, kilogramo...).
+- Inoiz ez erabili neurri-unitateen laburdurak; beti hitzez eman (adibidez: metro segunduko, kilometro orduko, kilometro, kilogramo).
 - Inoiz ez erabili emotikonoak edo emojiak.
 - Ez erabili markdown formaturik edo markdown ikurrik.
 - Ez zerrenda luzeak edo azalpen gehiegi, erabiltzaileak eskatu ezean.
@@ -984,10 +986,12 @@ fn strip_visual_decorations(input: &str) -> String {
         cleaned = cleaned.replace(emoticon, "");
     }
 
-    cleaned
+    let sanitized: String = cleaned
         .chars()
         .filter(|&c| !is_emoji_or_emoticon(c) && !is_markdown_symbol(c))
-        .collect()
+        .collect();
+
+    normalize_measurement_units(&sanitized)
 }
 
 fn is_emoji_or_emoticon(c: char) -> bool {
@@ -997,6 +1001,59 @@ fn is_emoji_or_emoticon(c: char) -> bool {
 
 fn is_markdown_symbol(c: char) -> bool {
     matches!(c, '*' | '_' | '`' | '#' | '>' | '|' | '~' | '[' | ']')
+}
+
+fn normalize_measurement_units(input: &str) -> String {
+    fn expand_unit_token(token: &str) -> Option<&'static str> {
+        match token.to_lowercase().as_str() {
+            "m/s" => Some("metro segunduko"),
+            "m/s2" | "m/s²" => Some("metro segunduko karratu"),
+            "km/h" => Some("kilometro orduko"),
+            "km" => Some("kilometro"),
+            "kg" => Some("kilogramo"),
+            "cm" => Some("zentimetro"),
+            "mm" => Some("milimetro"),
+            "m2" | "m²" => Some("metro karratu"),
+            "m3" | "m³" => Some("metro kubiko"),
+            "°c" | "ºc" => Some("gradu celsius"),
+            _ => None,
+        }
+    }
+
+    fn is_unit_char(ch: char) -> bool {
+        ch.is_alphanumeric() || matches!(ch, '/' | '°' | 'º' | '²' | '³')
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut token = String::new();
+
+    for ch in input.chars() {
+        if is_unit_char(ch) {
+            token.push(ch);
+            continue;
+        }
+
+        if !token.is_empty() {
+            if let Some(expanded) = expand_unit_token(&token) {
+                out.push_str(expanded);
+            } else {
+                out.push_str(&token);
+            }
+            token.clear();
+        }
+
+        out.push(ch);
+    }
+
+    if !token.is_empty() {
+        if let Some(expanded) = expand_unit_token(&token) {
+            out.push_str(expanded);
+        } else {
+            out.push_str(&token);
+        }
+    }
+
+    out
 }
 
 fn drain_audio_queue(rx: &Receiver<Vec<f32>>) {
